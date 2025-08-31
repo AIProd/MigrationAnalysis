@@ -5,3 +5,10 @@ pillow
 numpy
 pandas
 opencv-python-headless
+
+streamlit
+numpy
+pandas
+matplotlib
+scikit-image
+Pillow
