@@ -1,7 +1,7 @@
 import io
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -89,7 +89,14 @@ def segment_open(gray01: np.ndarray, std_sigma: float, sens: float,
 def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
                   std_sigma: float, sens: float, open_r: int, close_r: int,
                   min_area: int, open_class: str, sbw: float, sbh: float):
-    """Return (raw_open_pct, overlay_png_bytes)."""
+    """
+    Return (raw_open_pct, overlay_png_bytes).
+    The overlay image includes:
+      - ROI box (green)
+      - Segmentation overlay (teal)
+      - Scale-bar region grayed (if enabled)
+      - Open area label text (top-left inside ROI)
+    """
     rgb = np.array(pil_image.convert("RGB"))
     rgb = _downscale(rgb, max_side=1600)
     gray = rgb2gray(rgb).astype(np.float32)
@@ -112,16 +119,35 @@ def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
 
     raw_open_pct = 100.0 * (valid.sum() / max(1, keep_pix))
 
-    # Overlay: corrected image + mask + ROI box; gray out scale-bar region
+    # Overlay: corrected image + mask
     base = (corr * 255).astype(np.uint8)
     base_rgb = np.repeat(base[..., None], 3, axis=2)
     overlay = overlay_mask(base_rgb, valid, alpha=0.42, color=(0, 180, 255))
 
+    # draw green ROI box
     rr0, rr1 = int(h * roi_margin), int(h * (1 - roi_margin))
     cc0, cc1 = int(w * roi_margin), int(w * (1 - roi_margin))
     overlay[rr0:rr1, [cc0, cc1 - 1]] = (0, 255, 90)
     overlay[[rr0, rr1 - 1], cc0:cc1] = (0, 255, 90)
+
+    # gray out scale-bar region
     overlay[sb] = (200, 200, 200)
+
+    # ---- NEW: draw open area text on the overlay ----
+    label = f"Open: {raw_open_pct:.2f}%"
+    text_xy = (max(8, cc0 + 8), max(8, rr0 + 8))  # inside ROI, top-left
+    pil_overlay = Image.fromarray(overlay)
+    draw = ImageDraw.Draw(pil_overlay)
+    # Draw with outline for readability
+    try:
+        draw.text(text_xy, label, fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0))
+    except TypeError:
+        # Older Pillow without stroke_* support: fallback shadow
+        shadow = (text_xy[0] + 1, text_xy[1] + 1)
+        draw.text(shadow, label, fill=(0, 0, 0))
+        draw.text(text_xy, label, fill=(255, 255, 255))
+    overlay = np.array(pil_overlay)
+    # -----------------------------------------------
 
     buf = io.BytesIO()
     Image.fromarray(overlay).save(buf, format="PNG")
