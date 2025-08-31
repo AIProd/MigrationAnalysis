@@ -1,4 +1,5 @@
 import io
+import os
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
@@ -139,29 +140,61 @@ def summarize_series(raw_by_t: dict):
     df = pd.DataFrame(rows).set_index("Hours")
     return df, baseline
 
-def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br") -> bytes:
-    """Draw a semi-transparent label with text onto PNG bytes."""
+def _try_load_font(size: int):
+    # Try common DejaVu (usually present). Fallback to default.
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br", scale: float = 0.035,
+                   fg=(255, 221, 0, 255),  # bright yellow
+                   shadow=(0, 0, 0, 255)): # black outline
+    """
+    Draw a high-contrast, large label onto PNG bytes.
+    - scale: fraction of image width that controls font size (~3.5% by default)
+    """
     img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
     draw = ImageDraw.Draw(img, "RGBA")
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-    # text block
-    pad = 6
-    tw, th = draw.textbbox((0,0), text, font=font)[2:]
-    w, h = img.size
-    if corner == "br":   # bottom-right
-        x0, y0 = w - tw - 2*pad - 8, h - th - 2*pad - 8
+    W, H = img.size
+
+    # Font size proportional to image width, min 16
+    fsize = max(16, int(W * scale))
+    font = _try_load_font(fsize)
+
+    # Measure text
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = max(6, fsize // 4)
+
+    # Corner placement
+    if corner == "br":
+        x0, y0 = W - tw - 2 * pad - 8, H - th - 2 * pad - 8
     elif corner == "bl":
-        x0, y0 = 8, h - th - 2*pad - 8
+        x0, y0 = 8, H - th - 2 * pad - 8
     elif corner == "tr":
-        x0, y0 = w - tw - 2*pad - 8, 8
-    else: # "tl"
+        x0, y0 = W - tw - 2 * pad - 8, 8
+    else:  # "tl"
         x0, y0 = 8, 8
-    x1, y1 = x0 + tw + 2*pad, y0 + th + 2*pad
-    draw.rectangle([x0, y0, x1, y1], fill=(0,0,0,150))
-    draw.text((x0+pad, y0+pad), text, fill=(255,255,255,255), font=font)
+    x1, y1 = x0 + tw + 2 * pad, y0 + th + 2 * pad
+
+    # Semi-transparent panel
+    draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0, 150))
+
+    # Text with outline (shadow)
+    tx, ty = x0 + pad, y0 + pad
+    for dx,dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(-1,1),(1,-1)]:
+        draw.text((tx+dx, ty+dy), text, fill=shadow, font=font)
+    draw.text((tx, ty), text, fill=fg, font=font)
+
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG")
     return out.getvalue()
@@ -169,7 +202,7 @@ def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br") -> bytes:
 # ------------------------------- UI -----------------------------------
 st.title("Migration Image Analysis")
 
-# --- Sidebar controls (clean main view) ---
+# --- Sidebar controls to keep the main layout compact ---
 with st.sidebar:
     st.header("Settings")
     concentration = st.selectbox("Concentration", CONCENTRATIONS, index=1)
@@ -187,18 +220,7 @@ with st.sidebar:
     sb_width = st.slider("Scale-bar width (frac)", 0.00, 0.30, 0.12, 0.01, disabled=not sb_mask)
     sb_height = st.slider("Scale-bar height (frac)", 0.00, 0.20, 0.06, 0.01, disabled=not sb_mask)
 
-    with st.expander("What do these settings do?"):
-        st.markdown("""
-- **ROI margin**: trims the image edges before measuring. Set **0** for full-image analysis.
-- **BG sigma**: smoothness of illumination correction; larger = stronger background flattening.
-- **Texture sigma**: neighborhood size for texture (local std). Larger = coarser texture.
-- **Sensitivity**: shifts the threshold on the texture map. **Lower** finds **more** open area; **higher** finds **less**.
-- **Cleanup**: morphological open/close radii to remove small noise and smooth boundaries.
-- **Open class**: whether open area is **low** texture (typical) or **high** texture (if inverted). **Auto** picks for you.
-- **Mask scale bar**: exclude a bottom-right rectangle (set width/height fractions) from measurement.
-        """)
-
-# Uploads row (compact grid)
+# Uploads (inline, compact row)
 st.markdown("#### Upload images")
 u1, u2, u3, u4 = st.columns(4)
 uploads = {}
@@ -234,7 +256,7 @@ if go and uploads:
         )
         raw[t], overlays[t] = val, ov
 
-    # AUTO: flip to 'high' if later timepoints are mostly more open than baseline
+    # AUTO: flip to 'high' if later timepoints look more "open" than baseline
     if open_mode == "Auto" and 0 in raw and len(raw) > 1:
         later = [raw[t] for t in raw if t != 0 and not np.isnan(raw[t])]
         if later and np.nanmedian(later) > raw[0]:
@@ -253,44 +275,47 @@ if go and uploads:
     # Build baseline-normalized table
     df, baseline = summarize_series(raw)
 
-    # Annotate overlays with metrics and display in a compact grid
-    st.markdown("#### Detection overlays (annotated)")
-    gcols = st.columns(2)
-    for i, t in enumerate(sorted(overlays.keys())):
-        rel = df.loc[t, "Relative Open %"] if t in df.index else np.nan
-        clo = df.loc[t, "Closure %"] if t in df.index else np.nan
-        if np.isnan(rel):
-            label = f"{t}h — Open {raw[t]:.2f}%"
+    # === Two equal halves: left (images), right (table + plot) ===
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.markdown("#### Detection overlays (annotated)")
+        gcols = st.columns(2)  # 2×2 grid max
+        for i, t in enumerate(sorted(overlays.keys())):
+            rel = df.loc[t, "Relative Open %"] if t in df.index else np.nan
+            clo = df.loc[t, "Closure %"] if t in df.index else np.nan
+            if np.isnan(rel):
+                label = f"{t}h — Open {raw[t]:.2f}%"
+            else:
+                label = f"{t}h — Open {raw[t]:.2f}% | Rel {rel:.1f}% | Close {clo:.1f}%"
+            annotated = annotate_bytes(overlays[t], label, corner="br", scale=0.04, fg=(255,221,0,255))
+            with gcols[i % 2]:
+                st.image(annotated, use_container_width=True)
+
+    with right:
+        st.markdown("#### 📊 Baseline-normalized results")
+        st.dataframe(df.style.format("{:.2f}"), use_container_width=True, height=280)
+
+        # Compact plot
+        fig, ax = plt.subplots(figsize=(5.4, 3.6))
+        x = df.index.values
+        y = df["Closure %"].values.astype(float)
+        if np.isfinite(y).any():
+            ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+            ylo = min(-10, ymin - 5) if np.isfinite(ymin) else -10
+            yhi = max(100, ymax + 5) if np.isfinite(ymax) else 100
         else:
-            label = f"{t}h — Open {raw[t]:.2f}% | Rel {rel:.1f}% | Close {clo:.1f}%"
-        annotated = annotate_bytes(overlays[t], label, corner="br")
-        with gcols[i % 2]:
-            st.image(annotated, caption=None, use_container_width=True)
+            ylo, yhi = -10, 100
+        ax.plot(x, y, marker="o", linewidth=2, color="#009E73", label=f"{concentration} p/mL")
+        ax.set_xlabel("Hours"); ax.set_ylabel("Closure % (relative to 0h)")
+        ax.set_title(f"Closure — baseline {baseline:.2f}% open", fontsize=11)
+        ax.grid(True, linestyle="--", alpha=0.5); ax.set_ylim(ylo, yhi)
+        ax.legend(fontsize=9)
+        st.pyplot(fig, use_container_width=True)
 
-    # Table + plot + CSV in a right column
-    st.markdown("#### 📊 Baseline-normalized results")
-    st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
-
-    # Closure plot with dynamic y-limits
-    fig, ax = plt.subplots(figsize=(6.2, 4.0))
-    x = df.index.values
-    y = df["Closure %"].values.astype(float)
-    if np.isfinite(y).any():
-        ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
-        ylo = min(-10, ymin - 5) if np.isfinite(ymin) else -10
-        yhi = max(100, ymax + 5) if np.isfinite(ymax) else 100
-    else:
-        ylo, yhi = -10, 100
-    ax.plot(x, y, marker="o", linewidth=2, color="#009E73", label=f"{concentration} p/mL")
-    ax.set_xlabel("Hours"); ax.set_ylabel("Closure % (relative to 0h)")
-    ax.set_title(f"Closure Curve — {concentration} p/mL (baseline {baseline:.2f}% open)")
-    ax.grid(True, linestyle="--", alpha=0.5); ax.set_ylim(ylo, yhi)
-    ax.legend()
-    st.pyplot(fig, use_container_width=True)
-
-    # CSV download
-    csv = df.reset_index().to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", csv, file_name=f"results_{concentration}.csv", use_container_width=True)
+        # CSV download
+        csv = df.reset_index().to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, file_name=f"results_{concentration}.csv", use_container_width=True)
 
 else:
     st.info("Upload at least one image and click **Analyze**. For baseline normalization, include **0h**.")
