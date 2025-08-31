@@ -42,7 +42,7 @@ def local_std(gray: np.ndarray, sigma: float) -> np.ndarray:
     return std
 
 def center_roi_mask(h: int, w: int, margin_frac: float) -> np.ndarray:
-    """Centered ROI; trims margins on all sides."""
+    """Centered ROI; trims margins on all sides. margin=0 → full image."""
     r0, r1 = int(h * margin_frac), int(h * (1 - margin_frac))
     c0, c1 = int(w * margin_frac), int(w * (1 - margin_frac))
     m = np.zeros((h, w), dtype=bool)
@@ -51,6 +51,8 @@ def center_roi_mask(h: int, w: int, margin_frac: float) -> np.ndarray:
 
 def mask_scale_bar(h: int, w: int, width_frac: float, height_frac: float, inset_frac: float = 0.02) -> np.ndarray:
     """Mask a bottom-right rectangle (scale bar area)."""
+    if width_frac <= 0 or height_frac <= 0:
+        return np.zeros((h, w), dtype=bool)
     bw = int(w * width_frac); bh = int(h * height_frac)
     r1 = int(h * (1 - inset_frac)); r0 = max(0, r1 - bh)
     c1 = int(w * (1 - inset_frac)); c0 = max(0, c1 - bw)
@@ -103,26 +105,23 @@ def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
     # ROI (center) & optional scale-bar mask (bottom-right)
     h, w = mask_open.shape
     roi = center_roi_mask(h, w, roi_margin)
-    sb = mask_scale_bar(h, w, width_frac=sbw, height_frac=sbh) if (sbw > 0 and sbh > 0) else np.zeros_like(roi)
+    sb = mask_scale_bar(h, w, width_frac=sbw, height_frac=sbh)
     keep = roi & ~sb
+    keep_pix = int(keep.sum())
     valid = mask_open & keep
 
-    raw_open_pct = 100.0 * (valid.sum() / max(1, keep.sum()))
+    raw_open_pct = 100.0 * (valid.sum() / max(1, keep_pix))
 
-    # Overlay: corrected image + mask + ROI box
+    # Overlay: corrected image + mask + ROI box; gray out scale-bar region
     base = (corr * 255).astype(np.uint8)
     base_rgb = np.repeat(base[..., None], 3, axis=2)
     overlay = overlay_mask(base_rgb, valid, alpha=0.42, color=(0, 180, 255))
 
-    # draw green ROI box
     rr0, rr1 = int(h * roi_margin), int(h * (1 - roi_margin))
     cc0, cc1 = int(w * roi_margin), int(w * (1 - roi_margin))
     overlay[rr0:rr1, [cc0, cc1 - 1]] = (0, 255, 90)
     overlay[[rr0, rr1 - 1], cc0:cc1] = (0, 255, 90)
-
-    # gray out the scale-bar region (if any)
-    if sb.any():
-        overlay[sb] = (200, 200, 200)
+    overlay[sb] = (200, 200, 200)
 
     buf = io.BytesIO()
     Image.fromarray(overlay).save(buf, format="PNG")
@@ -146,7 +145,9 @@ c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 1.0, 1.05, 1.05, 1.15, 1.15, 1
 with c1:
     concentration = st.selectbox("Concentration", CONCENTRATIONS, index=1)
 with c2:
-    roi_margin = st.slider("ROI margin", 0.05, 0.25, 0.12, 0.01, help="Crop edges to avoid scale bar/artefacts")
+    # 0.00 = full image coverage
+    roi_margin = st.slider("ROI margin (0 = full image)", 0.00, 0.25, 0.00, 0.01,
+                           help="Crop edges to avoid artefacts; set 0 for full-frame analysis")
 with c3:
     bg_sigma = st.slider("BG sigma", 10.0, 80.0, 42.0, 2.0, help="Illumination correction blur")
 with c4:
@@ -154,7 +155,7 @@ with c4:
 with c5:
     sens = st.slider("Sensitivity", -0.35, 0.35, 0.00, 0.01, help="Lower→more open, Higher→less open")
 with c6:
-    # FIX: selectbox with label→radii mapping (no tuples as direct widget values)
+    # Stable cleanup control (no tuple crash)
     cleanup_label = st.selectbox("Cleanup", ["Light (2/2)","Med (3/3)","Strong (4/3)","Custom (1/1)"], index=1)
     map_r = {"Light (2/2)":(2,2), "Med (3/3)":(3,3), "Strong (4/3)":(4,3), "Custom (1/1)":(1,1)}
     open_r, close_r = map_r[cleanup_label]
@@ -162,11 +163,11 @@ with c7:
     open_mode = st.selectbox("Open class", ["Low texture","High texture","Auto"], index=0,
                              help="If results look inverted, try 'High' or 'Auto'")
 with c8:
-    sb_mask = st.checkbox("Mask scale bar", value=True)
+    sb_mask = st.checkbox("Mask scale bar", value=False)
 sb_width = st.slider("Scale-bar width (frac)", 0.00, 0.30, 0.12, 0.01, disabled=not sb_mask)
 sb_height = st.slider("Scale-bar height (frac)", 0.00, 0.20, 0.06, 0.01, disabled=not sb_mask)
 
-# Uploads row (compact)
+# Uploads row (compact grid)
 st.markdown("#### Upload images")
 u1, u2, u3, u4 = st.columns(4)
 uploads = {}
@@ -177,7 +178,7 @@ for t, col in zip(TIMEPOINTS, [u1, u2, u3, u4]):
             try:
                 img = Image.open(f).convert("RGB")
                 uploads[t] = img
-                st.image(img, caption=f"{t}h", use_column_width=True)
+                st.image(img, caption=f"{t}h", use_container_width=True)
             except Exception:
                 st.error("Could not read image.")
 
@@ -188,7 +189,7 @@ go = st.button("▶️ Analyze", type="primary", use_container_width=True)
 if go and uploads:
     raw = {}
     overlays = {}
-    # First pass with chosen open_mode; 'Auto' will evaluate after
+    # Initial mode; 'Auto' starts as 'low' then flips if needed
     chosen_mode = "low" if open_mode == "Low texture" else ("high" if open_mode == "High texture" else "low")
 
     for t in sorted(uploads.keys()):
@@ -197,23 +198,24 @@ if go and uploads:
             roi_margin=roi_margin, bg_sigma=bg_sigma,
             std_sigma=std_sigma, sens=sens,
             open_r=open_r, close_r=close_r, min_area=600,
-            open_class=chosen_mode, sbw=(sb_width if sb_mask else 0.0), sbh=(sb_height if sb_mask else 0.0)
+            open_class=chosen_mode,
+            sbw=(sb_width if sb_mask else 0.0), sbh=(sb_height if sb_mask else 0.0)
         )
         raw[t], overlays[t] = val, ov
 
-    # If AUTO: flip mode if most later timepoints have larger "open" than baseline
+    # AUTO: flip to 'high' if later timepoints are mostly more open than baseline
     if open_mode == "Auto" and 0 in raw and len(raw) > 1:
-        later = [raw[t] for t in raw if t != 0]
-        if np.nanmedian(later) > raw[0]:  # looks inverted → recompute as 'high'
-            raw = {}
-            overlays = {}
+        later = [raw[t] for t in raw if t != 0 and not np.isnan(raw[t])]
+        if later and np.nanmedian(later) > raw[0]:
+            raw.clear(); overlays.clear()
             for t in sorted(uploads.keys()):
                 val, ov = analyze_image(
                     uploads[t],
                     roi_margin=roi_margin, bg_sigma=bg_sigma,
                     std_sigma=std_sigma, sens=sens,
                     open_r=open_r, close_r=close_r, min_area=600,
-                    open_class="high", sbw=(sb_width if sb_mask else 0.0), sbh=(sb_height if sb_mask else 0.0)
+                    open_class="high",
+                    sbw=(sb_width if sb_mask else 0.0), sbh=(sb_height if sb_mask else 0.0)
                 )
                 raw[t], overlays[t] = val, ov
 
@@ -225,7 +227,7 @@ if go and uploads:
         gcols = st.columns(2)
         for i, t in enumerate(sorted(overlays.keys())):
             with gcols[i % 2]:
-                st.image(overlays[t], caption=f"{t}h — overlay", use_column_width=True)
+                st.image(overlays[t], caption=f"{t}h — overlay", use_container_width=True)
 
     with right:
         st.markdown("#### 📊 Baseline-normalized results")
