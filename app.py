@@ -1,7 +1,7 @@
 import io
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -11,7 +11,7 @@ from skimage.filters import threshold_otsu, gaussian
 from skimage.morphology import remove_small_objects, binary_opening, binary_closing, disk
 
 # ----------------------------- PAGE CONFIG -----------------------------
-st.set_page_config(page_title="Wound Healing (Baseline-Normalized)", layout="wide")
+st.set_page_config(page_title="Migration Image Analysis", layout="wide")
 TIMEPOINTS = [0, 12, 24, 36]
 CONCENTRATIONS = ["Control", "8000", "16000", "32000", "64000"]
 
@@ -89,14 +89,7 @@ def segment_open(gray01: np.ndarray, std_sigma: float, sens: float,
 def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
                   std_sigma: float, sens: float, open_r: int, close_r: int,
                   min_area: int, open_class: str, sbw: float, sbh: float):
-    """
-    Return (raw_open_pct, overlay_png_bytes).
-    The overlay image includes:
-      - ROI box (green)
-      - Segmentation overlay (teal)
-      - Scale-bar region grayed (if enabled)
-      - Open area label text (top-left inside ROI)
-    """
+    """Return (raw_open_pct, overlay_png_bytes)."""
     rgb = np.array(pil_image.convert("RGB"))
     rgb = _downscale(rgb, max_side=1600)
     gray = rgb2gray(rgb).astype(np.float32)
@@ -119,35 +112,16 @@ def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
 
     raw_open_pct = 100.0 * (valid.sum() / max(1, keep_pix))
 
-    # Overlay: corrected image + mask
+    # Overlay: corrected image + mask + ROI box; gray out scale-bar region
     base = (corr * 255).astype(np.uint8)
     base_rgb = np.repeat(base[..., None], 3, axis=2)
     overlay = overlay_mask(base_rgb, valid, alpha=0.42, color=(0, 180, 255))
 
-    # draw green ROI box
     rr0, rr1 = int(h * roi_margin), int(h * (1 - roi_margin))
     cc0, cc1 = int(w * roi_margin), int(w * (1 - roi_margin))
     overlay[rr0:rr1, [cc0, cc1 - 1]] = (0, 255, 90)
     overlay[[rr0, rr1 - 1], cc0:cc1] = (0, 255, 90)
-
-    # gray out scale-bar region
     overlay[sb] = (200, 200, 200)
-
-    # ---- NEW: draw open area text on the overlay ----
-    label = f"Open: {raw_open_pct:.2f}%"
-    text_xy = (max(8, cc0 + 8), max(8, rr0 + 8))  # inside ROI, top-left
-    pil_overlay = Image.fromarray(overlay)
-    draw = ImageDraw.Draw(pil_overlay)
-    # Draw with outline for readability
-    try:
-        draw.text(text_xy, label, fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0))
-    except TypeError:
-        # Older Pillow without stroke_* support: fallback shadow
-        shadow = (text_xy[0] + 1, text_xy[1] + 1)
-        draw.text(shadow, label, fill=(0, 0, 0))
-        draw.text(text_xy, label, fill=(255, 255, 255))
-    overlay = np.array(pil_overlay)
-    # -----------------------------------------------
 
     buf = io.BytesIO()
     Image.fromarray(overlay).save(buf, format="PNG")
@@ -165,33 +139,64 @@ def summarize_series(raw_by_t: dict):
     df = pd.DataFrame(rows).set_index("Hours")
     return df, baseline
 
+def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br") -> bytes:
+    """Draw a semi-transparent label with text onto PNG bytes."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    draw = ImageDraw.Draw(img, "RGBA")
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    # text block
+    pad = 6
+    tw, th = draw.textbbox((0,0), text, font=font)[2:]
+    w, h = img.size
+    if corner == "br":   # bottom-right
+        x0, y0 = w - tw - 2*pad - 8, h - th - 2*pad - 8
+    elif corner == "bl":
+        x0, y0 = 8, h - th - 2*pad - 8
+    elif corner == "tr":
+        x0, y0 = w - tw - 2*pad - 8, 8
+    else: # "tl"
+        x0, y0 = 8, 8
+    x1, y1 = x0 + tw + 2*pad, y0 + th + 2*pad
+    draw.rectangle([x0, y0, x1, y1], fill=(0,0,0,150))
+    draw.text((x0+pad, y0+pad), text, fill=(255,255,255,255), font=font)
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
 # ------------------------------- UI -----------------------------------
-# Compact horizontal controls
-c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 1.0, 1.05, 1.05, 1.15, 1.15, 1.05, 1.15])
-with c1:
+st.title("Migration Image Analysis")
+
+# --- Sidebar controls (clean main view) ---
+with st.sidebar:
+    st.header("Settings")
     concentration = st.selectbox("Concentration", CONCENTRATIONS, index=1)
-with c2:
-    # 0.00 = full image coverage
     roi_margin = st.slider("ROI margin (0 = full image)", 0.00, 0.25, 0.00, 0.01,
                            help="Crop edges to avoid artefacts; set 0 for full-frame analysis")
-with c3:
     bg_sigma = st.slider("BG sigma", 10.0, 80.0, 42.0, 2.0, help="Illumination correction blur")
-with c4:
     std_sigma = st.slider("Texture sigma", 3.0, 30.0, 12.0, 1.0, help="Neighborhood size for local std")
-with c5:
     sens = st.slider("Sensitivity", -0.35, 0.35, 0.00, 0.01, help="Lower→more open, Higher→less open")
-with c6:
-    # Stable cleanup control (no tuple crash)
     cleanup_label = st.selectbox("Cleanup", ["Light (2/2)","Med (3/3)","Strong (4/3)","Custom (1/1)"], index=1)
     map_r = {"Light (2/2)":(2,2), "Med (3/3)":(3,3), "Strong (4/3)":(4,3), "Custom (1/1)":(1,1)}
     open_r, close_r = map_r[cleanup_label]
-with c7:
     open_mode = st.selectbox("Open class", ["Low texture","High texture","Auto"], index=0,
                              help="If results look inverted, try 'High' or 'Auto'")
-with c8:
     sb_mask = st.checkbox("Mask scale bar", value=False)
-sb_width = st.slider("Scale-bar width (frac)", 0.00, 0.30, 0.12, 0.01, disabled=not sb_mask)
-sb_height = st.slider("Scale-bar height (frac)", 0.00, 0.20, 0.06, 0.01, disabled=not sb_mask)
+    sb_width = st.slider("Scale-bar width (frac)", 0.00, 0.30, 0.12, 0.01, disabled=not sb_mask)
+    sb_height = st.slider("Scale-bar height (frac)", 0.00, 0.20, 0.06, 0.01, disabled=not sb_mask)
+
+    with st.expander("What do these settings do?"):
+        st.markdown("""
+- **ROI margin**: trims the image edges before measuring. Set **0** for full-image analysis.
+- **BG sigma**: smoothness of illumination correction; larger = stronger background flattening.
+- **Texture sigma**: neighborhood size for texture (local std). Larger = coarser texture.
+- **Sensitivity**: shifts the threshold on the texture map. **Lower** finds **more** open area; **higher** finds **less**.
+- **Cleanup**: morphological open/close radii to remove small noise and smooth boundaries.
+- **Open class**: whether open area is **low** texture (typical) or **high** texture (if inverted). **Auto** picks for you.
+- **Mask scale bar**: exclude a bottom-right rectangle (set width/height fractions) from measurement.
+        """)
 
 # Uploads row (compact grid)
 st.markdown("#### Upload images")
@@ -245,41 +250,47 @@ if go and uploads:
                 )
                 raw[t], overlays[t] = val, ov
 
-    # Layout: overlays grid (left) and metrics/plot (right)
-    left, right = st.columns([1.2, 1.0])
+    # Build baseline-normalized table
+    df, baseline = summarize_series(raw)
 
-    with left:
-        st.markdown("#### Detection overlays")
-        gcols = st.columns(2)
-        for i, t in enumerate(sorted(overlays.keys())):
-            with gcols[i % 2]:
-                st.image(overlays[t], caption=f"{t}h — overlay", use_container_width=True)
-
-    with right:
-        st.markdown("#### 📊 Baseline-normalized results")
-        df, baseline = summarize_series(raw)
-        st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
-
-        # Closure plot with dynamic y-limits
-        fig, ax = plt.subplots(figsize=(6.2, 4.0))
-        x = df.index.values
-        y = df["Closure %"].values.astype(float)
-        if np.isfinite(y).any():
-            ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
-            ylo = min(-10, ymin - 5) if np.isfinite(ymin) else -10
-            yhi = max(100, ymax + 5) if np.isfinite(ymax) else 100
+    # Annotate overlays with metrics and display in a compact grid
+    st.markdown("#### Detection overlays (annotated)")
+    gcols = st.columns(2)
+    for i, t in enumerate(sorted(overlays.keys())):
+        rel = df.loc[t, "Relative Open %"] if t in df.index else np.nan
+        clo = df.loc[t, "Closure %"] if t in df.index else np.nan
+        if np.isnan(rel):
+            label = f"{t}h — Open {raw[t]:.2f}%"
         else:
-            ylo, yhi = -10, 100
-        ax.plot(x, y, marker="o", linewidth=2, color="#009E73", label=f"{concentration} p/mL")
-        ax.set_xlabel("Hours"); ax.set_ylabel("Closure % (relative to 0h)")
-        ax.set_title(f"Closure Curve — {concentration} p/mL (baseline {baseline:.2f}% open)")
-        ax.grid(True, linestyle="--", alpha=0.5); ax.set_ylim(ylo, yhi)
-        ax.legend()
-        st.pyplot(fig, use_container_width=True)
+            label = f"{t}h — Open {raw[t]:.2f}% | Rel {rel:.1f}% | Close {clo:.1f}%"
+        annotated = annotate_bytes(overlays[t], label, corner="br")
+        with gcols[i % 2]:
+            st.image(annotated, caption=None, use_container_width=True)
 
-        # CSV download
-        csv = df.reset_index().to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", csv, file_name=f"results_{concentration}.csv", use_container_width=True)
+    # Table + plot + CSV in a right column
+    st.markdown("#### 📊 Baseline-normalized results")
+    st.dataframe(df.style.format("{:.2f}"), use_container_width=True)
+
+    # Closure plot with dynamic y-limits
+    fig, ax = plt.subplots(figsize=(6.2, 4.0))
+    x = df.index.values
+    y = df["Closure %"].values.astype(float)
+    if np.isfinite(y).any():
+        ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+        ylo = min(-10, ymin - 5) if np.isfinite(ymin) else -10
+        yhi = max(100, ymax + 5) if np.isfinite(ymax) else 100
+    else:
+        ylo, yhi = -10, 100
+    ax.plot(x, y, marker="o", linewidth=2, color="#009E73", label=f"{concentration} p/mL")
+    ax.set_xlabel("Hours"); ax.set_ylabel("Closure % (relative to 0h)")
+    ax.set_title(f"Closure Curve — {concentration} p/mL (baseline {baseline:.2f}% open)")
+    ax.grid(True, linestyle="--", alpha=0.5); ax.set_ylim(ylo, yhi)
+    ax.legend()
+    st.pyplot(fig, use_container_width=True)
+
+    # CSV download
+    csv = df.reset_index().to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", csv, file_name=f"results_{concentration}.csv", use_container_width=True)
 
 else:
     st.info("Upload at least one image and click **Analyze**. For baseline normalization, include **0h**.")
