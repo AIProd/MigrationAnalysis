@@ -226,7 +226,7 @@ u1, u2, u3, u4 = st.columns(4)
 uploads = {}
 for t, col in zip(TIMEPOINTS, [u1, u2, u3, u4]):
     with col:
-        f = st.file_uploader(f"{t} h", type=["png","jpg","jpeg"], key=f"tp{t}", label_visibility="visible")
+        f = st.file_uploader(f"{t} h", type=["png","jpg","jpeg","tiff"], key=f"tp{t}", label_visibility="visible")
         if f:
             try:
                 img = Image.open(f).convert("RGB")
